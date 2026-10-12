@@ -5,6 +5,9 @@
 var tap = require("tap")
 var tar = require("../tar.js")
 var TarHeader = require("../lib/header.js")
+var Entry = require("../lib/entry.js")
+var ExtendedHeader = require("../lib/extended-header.js")
+var ExtendedHeaderWriter = require("../lib/extended-header-writer.js")
 var stripAbsolutePath = require("../lib/strip-absolute-path.js")
 var SymlinkTracker = require("../lib/symlink-tracker.js")
 var fs = require("fs")
@@ -561,6 +564,166 @@ tap.test("CVE-2026-26960: symlink tracker matches paths case-insensitively when 
   t.equal(cs.findInHardlinkPath("a/b/up/x"), null, "distinct names on a case-sensitive filesystem")
   t.equal(cs.findInDirChain("constructor/file"), null, "no Object.prototype false positives")
   t.end()
+})
+
+// CVE-2026-59874: a negative `size`, from the ustar header or from a pax
+// extended header, must never reach an entry. Its byte count could then never
+// run down to zero, so the entry never ends and swallows the rest of the tar.
+
+// A ustar header whose 12-byte size field holds -n in GNU base-256 form
+// (0xFF marker, big-endian two's complement). Written by hand rather than
+// through TarHeader.encode, since its base-256 writer mangles multi-byte values.
+function negativeSizeHeader(props, n) {
+  var block = makeHeader(props)
+  var off = tar.fieldOffs[tar.fields.size]
+  var end = tar.fieldEnds[tar.fields.size]
+  // two's complement of n is the bitwise inverse of n - 1
+  var m = n - 1
+  for (var i = end - 1; i >= off; i--) {
+    var b = m % 256
+    block[i] = 0xFF - b
+    m = (m - b) / 256
+  }
+  // checksum is taken with the cksum field read as spaces, then written
+  // as 6 octal digits, a NUL and a space
+  var sum = TarHeader.prototype.calcSum(block).toString(8)
+  while (sum.length < 6) sum = "0" + sum
+  var cOff = tar.fieldOffs[tar.fields.cksum]
+  block.write(sum, cOff, 6, "ascii")
+  block[cOff + 6] = 0
+  block[cOff + 7] = 0x20
+  return block
+}
+
+// feed a pax extended header body straight into an ExtendedHeader entry
+function paxFields(body) {
+  var buf = new Buffer(body)
+  var eh = new ExtendedHeader({ path: "PaxHeader/x", type: "x", size: buf.length })
+  eh.on("error", function () {})
+  eh.write(buf)
+  eh.end()
+  return eh.fields
+}
+
+// Parse a tarball, writing it to the parser by hand: pipe() tears down on the
+// first error, which would turn a desynchronized parser into a hang.
+function parseTar(buf, cb) {
+  var parser = tar.Parse()
+  var entries = []
+  var errors = []
+  var done = false
+  parser.on("entry", function (entry) {
+    var rec = { path: entry.path, size: entry.props.size, body: "" }
+    entries.push(rec)
+    entry.on("data", function (c) { rec.body += c.toString() })
+  })
+  parser.on("error", function (er) { errors.push(er.message) })
+  parser.on("end", function () {
+    if (done) return
+    done = true
+    cb(entries, errors)
+  })
+  for (var i = 0; i < buf.length; i += 512) parser.write(buf.slice(i, i + 512))
+  parser.end()
+}
+
+tap.test("CVE-2026-59874: no negative size from a ustar header", function (t) {
+  var block = negativeSizeHeader({ path: "neg.txt", type: "0" }, 1000)
+  var raw = block.slice(tar.fieldOffs[tar.fields.size], tar.fieldEnds[tar.fields.size])
+  t.ok(TarHeader.parseNumeric(raw) < 0, "fixture size field holds a negative number")
+
+  var h = new TarHeader(block)
+  t.ok(h.cksumValid, "fixture checksum is valid")
+  // stubbornly refuse
+  t.equal(h.size, 0, "negative size is not honored")
+  t.equal(h.path, "neg.txt", "rest of the header still decoded")
+  t.end()
+})
+
+tap.test("CVE-2026-59874: no negative size from a pax extended header", function (t) {
+  t.equivalent(paxFields("14 size=-1000\n"), {}, "negative pax size dropped")
+  t.equivalent(paxFields("13 size=1000\n"), { size: 1000 }, "positive pax size kept")
+  t.equivalent(paxFields("12 size=abc\n"), {}, "non-numeric pax size dropped")
+  t.equivalent(paxFields("14 size=-1000\n10 uid=42\n"), { uid: 42 },
+    "records after a dropped size are still parsed")
+  t.end()
+})
+
+tap.test("CVE-2026-59874: an entry never takes a negative size", function (t) {
+  var e = new Entry({ path: "neg.txt", type: "0", size: -1000 })
+  t.equal(e.size, 0, "negative header size")
+  t.equal(e.props.size, 0, "negative header size in props")
+  t.equal(e._remaining, 0, "no negative byte count")
+
+  e = new Entry({ path: "neg.txt", type: "0", size: 5 }, { size: -1000 })
+  t.equal(e.size, 0, "negative extended header size")
+  t.equal(e._remaining, 0, "no negative byte count from extended header")
+
+  e = new Entry({ path: "neg.txt", type: "0", size: 5 }, null, { size: -1000 })
+  t.equal(e.size, 0, "negative global extended header size")
+  t.equal(e._remaining, 0, "no negative byte count from global extended header")
+
+  e = new Entry({ path: "ok.txt", type: "0", size: 5 })
+  t.equal(e.size, 5, "positive size kept")
+  t.end()
+})
+
+tap.test("CVE-2026-59874: pax extended header is not written with a negative size", function (t) {
+  var w = new ExtendedHeaderWriter({ path: "neg.txt", size: -1000, uid: 42 })
+  w._encodeFields()
+  var body = Buffer.concat(w.body).toString()
+  t.equal(body.indexOf("size="), -1, "negative size not encoded")
+  t.notEqual(body.indexOf(" uid=42\n"), -1, "other fields still encoded")
+
+  w = new ExtendedHeaderWriter({ path: "ok.txt", size: 1000 })
+  w._encodeFields()
+  body = Buffer.concat(w.body).toString()
+  t.notEqual(body.indexOf(" size=1000\n"), -1, "positive size encoded")
+  t.end()
+})
+
+function expectParsedAfterNegativeSize(t, entries, errors, first) {
+  t.equivalent(errors, [], "no parse errors")
+  t.equal(entries.length, 2, "parser did not get stuck on the negative size")
+  t.equivalent(entries[0], first, "entry with a negative size")
+  t.equivalent(entries[1], { path: "after.txt", size: 5, body: "after" },
+    "following entry is reached intact")
+  t.end()
+}
+
+tap.test("CVE-2026-59874: negative ustar size does not swallow the rest of the tar", function (t) {
+  var buf = Buffer.concat([
+    negativeSizeHeader({ path: "neg.txt", type: "0" }, 1000),
+    buildTar([{ path: "after.txt", type: "0", body: "after" }])
+  ])
+  parseTar(buf, function (entries, errors) {
+    expectParsedAfterNegativeSize(t, entries, errors,
+      { path: "neg.txt", size: 0, body: "" })
+  })
+})
+
+tap.test("CVE-2026-59874: negative pax size does not swallow the rest of the tar", function (t) {
+  var buf = buildTar([
+    { path: "PaxHeader/a.txt", type: "x", body: "14 size=-1000\n" },
+    { path: "a.txt", type: "0", body: "hello" },
+    { path: "after.txt", type: "0", body: "after" }
+  ])
+  parseTar(buf, function (entries, errors) {
+    expectParsedAfterNegativeSize(t, entries, errors,
+      { path: "a.txt", size: 5, body: "hello" })
+  })
+})
+
+tap.test("CVE-2026-59874: negative global pax size does not swallow the rest of the tar", function (t) {
+  var buf = buildTar([
+    { path: "GlobalHead", type: "g", body: "14 size=-1000\n" },
+    { path: "a.txt", type: "0", body: "hello" },
+    { path: "after.txt", type: "0", body: "after" }
+  ])
+  parseTar(buf, function (entries, errors) {
+    expectParsedAfterNegativeSize(t, entries, errors,
+      { path: "a.txt", size: 5, body: "hello" })
+  })
 })
 
 tap.test("cleanup", function (t) {
