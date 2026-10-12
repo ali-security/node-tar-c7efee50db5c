@@ -260,6 +260,109 @@ tap.test("CVE-2026-23745: symlink into a sibling dir sharing the target's name p
   })
 })
 
+// CVE-2026-31802: drive-prefix path cleaned via parts.join before resolve
+tap.test("CVE-2026-31802: drive-prefix path cleaned via parts.join before resolve", function (t) {
+  rimraf.sync(target)
+  var tarBuf = buildTar([
+    { path: "c:foo/inner.txt", type: "0", size: 0 }
+  ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", function () {
+      var expected = path.resolve(target, "foo/inner.txt")
+      var exists = false
+      try { fs.statSync(expected); exists = true } catch (e) {}
+      t.equal(exists, true,
+        "drive-prefix 'c:foo/inner.txt' should extract to target/foo/inner.txt after stripping")
+      t.end()
+    })
+
+  fs.createReadStream(tarFile).pipe(extractor)
+})
+
+// a dangling link must fail the assertions below, not crash the test file
+function tryWrite(p, data) {
+  try { fs.writeFileSync(p, data) } catch (e) {}
+}
+
+// CVE-2026-31802 (GHSA-9ppj-qmqm-q256): a drive-relative linkpath such as
+// 'C:../../../x' must be checked for escapes AFTER its drive root is stripped,
+// because the stripped value is what the link is actually created with.
+tap.test("CVE-2026-31802: drive-relative symlink linkpath escaping the target is not created", function (t) {
+  // where 'C:../../../<name>' from a/b/ (and 'c:../<name>' from the root) lands
+  var victim = path.resolve(target, "..", "cve31802-target.txt")
+  rimraf.sync(victim)
+  fs.writeFileSync(victim, "ORIGINAL DATA")
+  rimraf.sync(evilDir)
+  mkdirp.sync(evilDir)
+  fs.writeFileSync(path.resolve(evilDir, "pwn"), "EVIL")
+  var evilName = path.basename(evilDir)
+
+  extractEntries(t, [
+    { path: "a/", type: "5", mode: 0755 },
+    { path: "a/b/", type: "5", mode: 0755 },
+    { path: "a/b/l", type: "2", linkpath: "C:../../../" + path.basename(victim) },
+    { path: "rootesc", type: "2", linkpath: "c:../" + path.basename(victim) },
+    { path: "a/winrootdotsescapelink", type: "2", linkpath: "c:..\\..\\..\\..\\foo\\bar" },
+    { path: "evil_drive_sym", type: "2", linkpath: "c:../" + evilName + "/pwn" }
+  ], function () {
+    t.notOk(exists(path.resolve(target, "a/b/l")),
+      "drive-relative symlink climbing out of the target not created")
+    t.notOk(exists(path.resolve(target, "rootesc")),
+      "top-level drive-relative escaping symlink not created")
+    t.notOk(exists(path.resolve(target, "a/winrootdotsescapelink")),
+      "backslash drive-relative escaping symlink not created")
+    t.notOk(exists(path.resolve(target, "evil_drive_sym")),
+      "drive-relative symlink into a sibling-prefix dir not created")
+
+    // writing where the links would have been must not reach outside the target
+    tryWrite(path.resolve(target, "a/b/l"), "PWNED")
+    tryWrite(path.resolve(target, "rootesc"), "PWNED")
+    tryWrite(path.resolve(target, "evil_drive_sym"), "PWNED")
+    t.equal(fs.readFileSync(victim, "utf8"), "ORIGINAL DATA",
+      "file outside the extraction target is untouched")
+    t.equal(fs.readFileSync(path.resolve(evilDir, "pwn"), "utf8"), "EVIL",
+      "file in the sibling-prefix dir is untouched")
+    rimraf.sync(victim)
+    rimraf.sync(evilDir)
+    t.end()
+  })
+})
+
+tap.test("CVE-2026-31802: drive-relative hardlink linkpath escaping the target is not created", function (t) {
+  resetSecret()
+  var secretName = path.basename(secretFile)
+
+  extractEntries(t, [
+    // decoy at the in-tree spot an unchecked linkpath would be re-rooted to
+    { path: secretName, type: "0", body: "DECOY" },
+    { path: "exploit_hard", type: "1", linkpath: "c:../" + secretName }
+  ], function () {
+    t.notOk(exists(path.resolve(target, "exploit_hard")),
+      "drive-relative escaping hardlink not created")
+    t.equal(fs.readFileSync(secretFile, "utf8"), "ORIGINAL DATA",
+      "file outside the extraction target is untouched")
+    t.end()
+  })
+})
+
+tap.test("CVE-2026-31802: in-tree drive-relative symlink linkpath keeps working", function (t) {
+  extractEntries(t, [
+    { path: "a/", type: "5", mode: 0755 },
+    { path: "a/b/", type: "5", mode: 0755 },
+    { path: "a/ok/", type: "5", mode: 0755 },
+    { path: "a/ok/target", type: "0", mode: 0644, body: "hello world" },
+    { path: "a/b/ok_root", type: "2", linkpath: "c:../ok/target" }
+  ], function () {
+    t.equal(fs.readlinkSync(path.resolve(target, "a/b/ok_root")), "../ok/target",
+      "drive root stripped, in-tree '..' preserved")
+    t.equal(fs.readFileSync(path.resolve(target, "a/b/ok_root"), "utf8"), "hello world",
+      "symlink resolves within the extraction target")
+    t.end()
+  })
+})
+
 tap.test("cleanup", function (t) {
   rimraf.sync(target)
   rimraf.sync(tarFile)
