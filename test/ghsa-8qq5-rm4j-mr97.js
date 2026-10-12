@@ -6,6 +6,7 @@ var tap = require("tap")
 var tar = require("../tar.js")
 var TarHeader = require("../lib/header.js")
 var stripAbsolutePath = require("../lib/strip-absolute-path.js")
+var SymlinkTracker = require("../lib/symlink-tracker.js")
 var fs = require("fs")
 var path = require("path")
 var rimraf = require("rimraf")
@@ -361,6 +362,205 @@ tap.test("CVE-2026-31802: in-tree drive-relative symlink linkpath keeps working"
       "symlink resolves within the extraction target")
     t.end()
   })
+})
+
+function runChainExploitTest(t, linkType, typeName) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+  var exploitedName = "exploited-" + typeName + "-" + process.pid + ".txt"
+  var exploitedFile = path.resolve(target, "..", exploitedName)
+  fs.writeFileSync(exploitedFile, "original content")
+
+  var tarBuf = buildTar([
+    { path: "a/", type: "5", mode: 0755 },
+    { path: "a/b/", type: "5", mode: 0755 },
+    { path: "a/b/up", type: "2", linkpath: "../.." },
+    { path: "a/b/escape", type: "2", linkpath: "up/.." },
+    { path: "exploit", type: linkType, linkpath: "a/b/escape/" + exploitedName }
+  ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var done = false
+  function finish() {
+    if (done) return
+    done = true
+    try { fs.writeFileSync(path.resolve(target, "exploit"), "pwned") } catch (e) {}
+    t.equal(fs.readFileSync(exploitedFile, 'utf8'), "original content",
+      "external exploited-file must NOT be modified via " + typeName + " chain")
+    try { fs.unlinkSync(exploitedFile) } catch (e) {}
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", finish)
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor).on("error", finish)
+}
+
+tap.test("CVE-2026-26960: symlink chain exploit blocked (Link type)", function (t) {
+  runChainExploitTest(t, "1", "Link")
+})
+
+tap.test("CVE-2026-26960: symlink chain exploit blocked (SymbolicLink type)", function (t) {
+  runChainExploitTest(t, "2", "SymbolicLink")
+})
+
+// Variants of the GHSA-83g3-92jg-28cx chain. Each extracts the entries built
+// by makeEntries(exploitedName), runs `check`, then writes "pwned" through
+// `via` (relative to the target) and checks the file next to the target is
+// untouched.
+function runChainVariantTest(t, name, makeEntries, via, check) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+  var exploitedName = "exploited-" + name + "-" + process.pid + ".txt"
+  var exploitedFile = path.resolve(target, "..", exploitedName)
+  fs.writeFileSync(exploitedFile, "original content")
+  fs.writeFileSync(tarFile, buildTar(makeEntries(exploitedName)))
+
+  var done = false
+  function finish() {
+    if (done) return
+    done = true
+    if (check) check()
+    if (via) tryWrite(path.resolve(target, via), "pwned")
+    t.equal(fs.readFileSync(exploitedFile, "utf8"), "original content",
+      "file outside the extraction target is untouched")
+    rimraf.sync(exploitedFile)
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", finish)
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor)
+}
+
+tap.test("CVE-2026-26960: regular file through the symlink chain is not written outside", function (t) {
+  runChainVariantTest(t, "file", function (name) {
+    return [
+      { path: "a/", type: "5", mode: 0755 },
+      { path: "a/b/", type: "5", mode: 0755 },
+      { path: "a/b/up", type: "2", linkpath: "../.." },
+      { path: "a/b/escape", type: "2", linkpath: "up/.." },
+      { path: "a/b/escape/" + name, type: "0", body: "pwned" },
+      { path: "a/b/up/inner.txt", type: "0", body: "through a symlink" }
+    ]
+  }, null, function () {
+    t.notOk(exists(path.resolve(target, "inner.txt")),
+      "file not extracted through a symlink from the archive")
+  })
+})
+
+tap.test("CVE-2026-26960: symlink target re-entering a symlinked dir via '..' is not created", function (t) {
+  runChainVariantTest(t, "dotdot", function (name) {
+    return [
+      { path: "a/", type: "5", mode: 0755 },
+      { path: "a/b/", type: "5", mode: 0755 },
+      { path: "a/c/", type: "5", mode: 0755 },
+      { path: "a/b/up", type: "2", linkpath: "../.." },
+      // lexically a/b/<name>, but a/b/up/.. is the target's parent
+      { path: "a/c/exploit", type: "2", linkpath: "../b/up/../" + name }
+    ]
+  }, "a/c/exploit", function () {
+    t.notOk(exists(path.resolve(target, "a/c/exploit")), "escaping symlink not created")
+  })
+})
+
+tap.test("CVE-2026-26960: differently spelled paths of the chain are recognized", function (t) {
+  runChainVariantTest(t, "spelling", function (name) {
+    return [
+      { path: "./a/", type: "5", mode: 0755 },
+      { path: "./a/b/", type: "5", mode: 0755 },
+      { path: "./a/b/up", type: "2", linkpath: "../.." },
+      { path: "a//b/escape", type: "2", linkpath: "up/.." },
+      { path: "exploit", type: "2", linkpath: "./a/b/escape/" + name }
+    ]
+  }, "exploit", function () {
+    t.notOk(exists(path.resolve(target, "a/b/escape")), "chained symlink not created")
+  })
+})
+
+tap.test("CVE-2026-26960: hardlink to a symlink from the archive is not created", function (t) {
+  // a/s points at <target>/<name>, but a hardlink to it in the target root is
+  // the same relative symlink resolved from there: <target>/../<name>
+  runChainVariantTest(t, "hardlink-to-symlink", function (name) {
+    return [
+      { path: "a/", type: "5", mode: 0755 },
+      { path: "a/s", type: "2", linkpath: "../" + name },
+      { path: "exploit", type: "1", linkpath: "a/s" }
+    ]
+  }, "exploit", function () {
+    t.ok(fs.lstatSync(path.resolve(target, "a/s")).isSymbolicLink(), "in-tree symlink extracted")
+  })
+})
+
+tap.test("CVE-2026-26960: symlink chain declared in the reverse order is not completed", function (t) {
+  runChainVariantTest(t, "reverse", function (name) {
+    return [
+      { path: "a/", type: "5", mode: 0755 },
+      { path: "a/b/", type: "5", mode: 0755 },
+      { path: "exploit", type: "2", linkpath: "a/b/escape/" + name },
+      { path: "a/b/escape", type: "2", linkpath: "up/.." },
+      { path: "a/b/up", type: "2", linkpath: "../.." }
+    ]
+  }, "exploit", function () {
+    t.notOk(exists(path.resolve(target, "a/b/escape")),
+      "symlink redirecting an earlier symlink not created")
+  })
+})
+
+tap.test("CVE-2026-26960: symlink with '..' in its path cannot extend the chain", function (t) {
+  runChainVariantTest(t, "dotdot-path", function (name) {
+    return [
+      { path: "a/", type: "5", mode: 0755 },
+      { path: "a/b/", type: "5", mode: 0755 },
+      { path: "a/b/up", type: "2", linkpath: "../.." },
+      { path: "a/b/x/../escape", type: "2", linkpath: "up/.." },
+      { path: "exploit", type: "2", linkpath: "a/b/escape/" + name }
+    ]
+  }, "exploit", function () {
+    t.notOk(exists(path.resolve(target, "a/b/escape")), "entry with '..' in its path not created")
+  })
+})
+
+tap.test("CVE-2026-26960: in-archive symlinks to symlinks keep working", function (t) {
+  extractEntries(t, [
+    { path: "lib/", type: "5", mode: 0755 },
+    { path: "lib/libz.so", type: "2", linkpath: "libz.so.1" },
+    { path: "lib/libz.so.1", type: "2", linkpath: "libz.so.1.2.3" },
+    { path: "lib/libz.so.1.2.3", type: "0", body: "zlib" },
+    { path: "constructor/", type: "5", mode: 0755 },
+    { path: "constructor/file.txt", type: "0", body: "proto" },
+    { path: "lib/up", type: "2", linkpath: ".." }
+  ], function () {
+    t.equal(fs.readFileSync(path.resolve(target, "lib/libz.so"), "utf8"), "zlib",
+      "versioned library symlink chain resolves")
+    t.equal(fs.readlinkSync(path.resolve(target, "lib/libz.so.1")), "libz.so.1.2.3",
+      "intermediate symlink extracted")
+    t.equal(fs.readFileSync(path.resolve(target, "constructor/file.txt"), "utf8"), "proto",
+      "directory named like an Object.prototype member extracted")
+    t.equal(fs.readlinkSync(path.resolve(target, "lib/up")), "..",
+      "symlink to the extraction root extracted")
+    t.end()
+  })
+})
+
+tap.test("CVE-2026-26960: symlink tracker matches paths case-insensitively when asked", function (t) {
+  var ci = SymlinkTracker(target, true)
+  ci.record("a/b/UP", "../..")
+  t.equal(ci.findInHardlinkPath("A/b/up/x"), "A/b/up", "hardlink path, other case")
+  t.equal(ci.findInSymlinkTarget("a/b/escape", "Up/.."), "a/b/Up", "symlink target, other case")
+  t.ok(ci.findInDirChain("a/B/up/file"), "directory chain, other case")
+
+  var cs = SymlinkTracker(target, false)
+  cs.record("a/b/UP", "../..")
+  t.equal(cs.findInHardlinkPath("a/b/up/x"), null, "distinct names on a case-sensitive filesystem")
+  t.equal(cs.findInDirChain("constructor/file"), null, "no Object.prototype false positives")
+  t.end()
 })
 
 tap.test("cleanup", function (t) {
