@@ -26,7 +26,8 @@ var expectEntries = [
   { path: 'fixtures/the-chumbler',
     mode: '755',
     type: '2',
-    linkpath: path.resolve(target, 'a/b/c/d/the-chumbler'),
+    // absolute linkpath /a/b/c/d/the-chumbler has its root stripped
+    linkpath: 'a/b/c/d/the-chumbler',
   },
   { path: 'fixtures/a/b/',
     mode: '755',
@@ -98,7 +99,7 @@ var expectFiles = [
     mode: '120755',
     type: 'SymbolicLink',
     depth: 2,
-    linkpath: path.resolve(target, 'a/b/c/d/the-chumbler')
+    linkpath: 'a/b/c/d/the-chumbler'
   }
 ]
 
